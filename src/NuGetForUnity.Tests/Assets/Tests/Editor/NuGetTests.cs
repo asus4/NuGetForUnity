@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -600,6 +601,95 @@ public class NuGetTests
     }
 
     [Test]
+    public void InstallPackageWithXcframeworkZipExtractsXcframework()
+    {
+        var package = new NugetPackageIdentifier("XcframeworkZip.Test", "1.0.0") { IsManuallyInstalled = true };
+        var tempDirectoryPath = Path.GetFullPath(Path.Combine(TestContext.CurrentContext.TestDirectory, "TempXcframeworkUnitTestFolder"));
+        Directory.CreateDirectory(tempDirectoryPath);
+        File.Copy(ConfigurationManager.NugetConfigFilePath, Path.Combine(tempDirectoryPath, NugetConfigFile.FileName), true);
+
+        try
+        {
+            CreateSyntheticXcframeworkPackage(tempDirectoryPath, package, false);
+
+            var nugetConfig = ConfigurationManager.NugetConfigFile;
+            nugetConfig.InstallFromCache = false;
+            nugetConfig.PackageSources.Clear();
+            nugetConfig.PackageSources.Add(new NugetPackageSourceLocal("LocalXcframeworkUnitTestSource", tempDirectoryPath));
+            nugetConfig.Save(ConfigurationManager.NugetConfigFilePath);
+            ConfigurationManager.LoadNugetConfigFile();
+
+            NugetPackageInstaller.InstallIdentifier(package);
+
+            Assert.IsTrue(InstalledPackagesManager.IsInstalled(package, false), "The package was NOT installed: {0} {1}", package.Id, package.Version);
+            var nativeRuntimeDirectory = Path.Combine(
+                ConfigurationManager.NugetConfigFile.RepositoryPath,
+                $"{package.Id}.{package.Version}",
+                "runtimes",
+                "ios",
+                "native");
+            var xcframeworkDirectory = Path.Combine(nativeRuntimeDirectory, "test.xcframework");
+            var xcframeworkZipPath = Path.Combine(nativeRuntimeDirectory, "test.xcframework.zip");
+            Assert.That(xcframeworkDirectory, Does.Exist.IgnoreFiles);
+            Assert.That(xcframeworkZipPath, Does.Not.Exist);
+
+            if (UnityVersion.Current >= new UnityVersion("2022.3.23f1"))
+            {
+                AssetDatabase.Refresh();
+                var path = $"Assets/Packages/{package.Id}.{package.Version}/runtimes/ios/native/test.xcframework";
+                var postprocessor = new NugetAssetPostprocessor { assetPath = path };
+                postprocessor.GetType().GetMethod("OnPreprocessAsset", BindingFlags.NonPublic | BindingFlags.Instance).Invoke(postprocessor, null);
+                AssetDatabase.Refresh();
+
+                var meta = AssetImporter.GetAtPath(path) as PluginImporter;
+                Assert.IsNotNull(meta, "Get meta file");
+                Assert.That(AssetDatabase.GetLabels(meta), Does.Contain("NuGetForUnity"));
+                Assert.IsFalse(meta.GetCompatibleWithAnyPlatform(), "Expected to have set compatible with any platform to false");
+                Assert.IsFalse(meta.GetCompatibleWithEditor(), "Expected to have set compatible with editor to false");
+                Assert.IsTrue(meta.GetCompatibleWithPlatform(BuildTarget.iOS), "Expected to be compatible with iOS");
+                Assert.IsFalse(meta.GetCompatibleWithPlatform(BuildTarget.Android), "Expected to be incompatible with Android");
+                Assert.IsFalse(meta.GetCompatibleWithPlatform(BuildTarget.StandaloneOSX), "Expected to be incompatible with macOS");
+            }
+        }
+        finally
+        {
+            NugetPackageUninstaller.UninstallAll(InstalledPackagesManager.InstalledPackages.ToList());
+            File.Copy(Path.Combine(tempDirectoryPath, NugetConfigFile.FileName), ConfigurationManager.NugetConfigFilePath, true);
+            ConfigurationManager.LoadNugetConfigFile();
+            Directory.Delete(tempDirectoryPath, true);
+        }
+    }
+
+    [Test]
+    public void ExtractXcframeworkZipRejectsZipSlipEntries()
+    {
+        var tempDirectoryPath = Path.GetFullPath(Path.Combine(TestContext.CurrentContext.TestDirectory, "TempXcframeworkZipSlipUnitTestFolder"));
+        var nativeDirectory = Path.Combine(tempDirectoryPath, "native");
+        var escapedFilePath = Path.Combine(tempDirectoryPath, "escaped.txt");
+        var xcframeworkZipPath = Path.Combine(nativeDirectory, "test.xcframework.zip");
+        Directory.CreateDirectory(nativeDirectory);
+
+        try
+        {
+            CreateXcframeworkZip(xcframeworkZipPath, true);
+
+            var method = typeof(NugetPackageInstaller).GetMethod("ExtractXcframeworkZip", BindingFlags.NonPublic | BindingFlags.Static);
+            var exception = Assert.Throws<TargetInvocationException>(() => method.Invoke(null, new object[] { xcframeworkZipPath }));
+
+            Assert.That(exception.InnerException, Is.TypeOf<InvalidDataException>());
+            Assert.That(Path.Combine(nativeDirectory, "test.xcframework"), Does.Not.Exist);
+            Assert.That(escapedFilePath, Does.Not.Exist);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDirectoryPath))
+            {
+                Directory.Delete(tempDirectoryPath, true);
+            }
+        }
+    }
+
+    [Test]
     [TestCase("1.0.0-rc1", "1.0.0")]
     [TestCase("1.0.0-rc1", "1.0.0-rc2")]
     [TestCase("1.2.3", "1.2.4")]
@@ -1175,5 +1265,87 @@ public class NuGetTests
         packageSources.Single(source => source.Name == "NuGet").IsEnabled =
             installMode == InstallMode.ApiV2Only || installMode == InstallMode.ApiV2AllowCached;
         nugetConfigFile.InstallFromCache = installMode == InstallMode.ApiV2AllowCached;
+    }
+
+    private static void CreateSyntheticXcframeworkPackage(string outputDirectory, INugetPackageIdentifier package, bool includeZipSlipEntry)
+    {
+        var packagePath = Path.Combine(outputDirectory, package.PackageFileName);
+        using (var packageFileStream = File.Create(packagePath))
+        using (var packageArchive = new ZipArchive(packageFileStream, ZipArchiveMode.Create))
+        {
+            AddTextEntry(
+                packageArchive,
+                $"{package.Id}.nuspec",
+                $@"<?xml version=""1.0"" encoding=""utf-8""?>
+<package xmlns=""http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd"">
+  <metadata>
+    <id>{package.Id}</id>
+    <version>{package.Version}</version>
+    <authors>NuGetForUnity</authors>
+    <description>Test package with a zipped xcframework.</description>
+    <dependencies>
+      <group targetFramework=""native0.0"" />
+    </dependencies>
+  </metadata>
+</package>");
+
+            using (var nestedZipStream = new MemoryStream())
+            {
+                using (var nestedZip = new ZipArchive(nestedZipStream, ZipArchiveMode.Create, true))
+                {
+                    AddXcframeworkEntries(nestedZip, includeZipSlipEntry);
+                }
+
+                nestedZipStream.Position = 0;
+                var packageEntry = packageArchive.CreateEntry("runtimes/ios/native/test.xcframework.zip");
+                using (var packageEntryStream = packageEntry.Open())
+                {
+                    nestedZipStream.CopyTo(packageEntryStream);
+                }
+            }
+        }
+    }
+
+    private static void CreateXcframeworkZip(string zipPath, bool includeZipSlipEntry)
+    {
+        using (var zipFileStream = File.Create(zipPath))
+        using (var zip = new ZipArchive(zipFileStream, ZipArchiveMode.Create))
+        {
+            AddXcframeworkEntries(zip, includeZipSlipEntry);
+        }
+    }
+
+    private static void AddXcframeworkEntries(ZipArchive zip, bool includeZipSlipEntry)
+    {
+        AddTextEntry(
+            zip,
+            "test.xcframework/Info.plist",
+            @"<?xml version=""1.0"" encoding=""UTF-8""?>
+<plist version=""1.0"">
+<dict>
+  <key>AvailableLibraries</key>
+  <array />
+  <key>CFBundlePackageType</key>
+  <string>XFWK</string>
+  <key>XCFrameworkFormatVersion</key>
+  <string>1.0</string>
+</dict>
+</plist>");
+        AddTextEntry(zip, "test.xcframework/ios-arm64/test.framework/Info.plist", "test framework plist");
+        AddTextEntry(zip, "test.xcframework/ios-arm64/test.framework/test", "test binary");
+
+        if (includeZipSlipEntry)
+        {
+            AddTextEntry(zip, "../escaped.txt", "unsafe");
+        }
+    }
+
+    private static void AddTextEntry(ZipArchive zip, string entryName, string contents)
+    {
+        var entry = zip.CreateEntry(entryName);
+        using (var writer = new StreamWriter(entry.Open()))
+        {
+            writer.Write(contents);
+        }
     }
 }

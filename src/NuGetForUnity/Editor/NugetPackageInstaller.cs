@@ -19,7 +19,12 @@ namespace NugetForUnity
     {
         private static readonly string[] RuntimePluginFileExtentions =
         {
-            ".so" /* Linux */, ".dylib" /* OSX */, ".dll" /* Windows */, ".lib", /* Windows */
+            ".so" /* Linux */,
+            ".dylib" /* OSX */,
+            ".dll" /* Windows */,
+            ".lib" /* Windows */,
+            ".xcframework" /* macOS or iOS */,
+            ".xcframework.zip" /* macOS or iOS */,
         };
 
         /// <summary>
@@ -296,6 +301,11 @@ namespace NugetForUnity
                                 (entryFullName.StartsWith("runtimes/", StringComparison.Ordinal) || entryFullName.Contains("/runtimes/")) &&
                                 RuntimePluginFileExtentions.Any(extension => entryFullName.EndsWith(extension, StringComparison.OrdinalIgnoreCase)))
                             {
+                                if (entryFullName.EndsWith(".xcframework.zip", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    extractedFilePath = ExtractXcframeworkZip(extractedFilePath);
+                                }
+
                                 // write a temporary plug-in importer setting that is replaced with the correct configuration by 'NugetAssetPostprocessor'
                                 WriteInitialExcludeAllPluginImporterConfig(extractedFilePath);
                             }
@@ -367,6 +377,56 @@ namespace NugetForUnity
 
                 EditorUtility.ClearProgressBar();
             }
+        }
+
+        [NotNull]
+        private static string ExtractXcframeworkZip([NotNull] string xcframeworkZipPath)
+        {
+            var nativeDirectory = Path.GetDirectoryName(xcframeworkZipPath) ??
+                                  throw new InvalidOperationException($"Failed to get directory name of '{xcframeworkZipPath}'");
+            var xcframeworkDirectory = Path.Combine(nativeDirectory, Path.GetFileNameWithoutExtension(xcframeworkZipPath));
+
+            using (var zip = ZipFile.OpenRead(xcframeworkZipPath))
+            {
+                var validatedEntries = zip.Entries.Select(entry => new { Entry = entry, Path = GetSafeNestedZipEntryPath(entry, nativeDirectory) }).ToList();
+                foreach (var validatedEntry in validatedEntries)
+                {
+                    if (validatedEntry.Entry.FullName.EndsWith("/", StringComparison.Ordinal))
+                    {
+                        Directory.CreateDirectory(validatedEntry.Path);
+                        continue;
+                    }
+
+                    var directory = Path.GetDirectoryName(validatedEntry.Path) ??
+                                    throw new InvalidOperationException($"Failed to get directory name of '{validatedEntry.Path}'");
+                    Directory.CreateDirectory(directory);
+                    validatedEntry.Entry.ExtractToFile(validatedEntry.Path, true);
+                }
+            }
+
+            File.Delete(xcframeworkZipPath);
+            File.Delete($"{xcframeworkZipPath}.meta");
+
+            return xcframeworkDirectory;
+        }
+
+        [NotNull]
+        private static string GetSafeNestedZipEntryPath([NotNull] ZipArchiveEntry entry, [NotNull] string baseDirectory)
+        {
+            baseDirectory = Path.GetFullPath(baseDirectory);
+            if (!baseDirectory.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+            {
+                baseDirectory += Path.DirectorySeparatorChar;
+            }
+
+            var entryFullName = entry.FullName;
+            var entryPath = Path.GetFullPath(Path.Combine(baseDirectory, entryFullName));
+            if (!entryPath.StartsWith(baseDirectory, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException($"Entry {entryFullName} is trying to leave the output directory.");
+            }
+
+            return entryPath;
         }
 
         private static void WriteInitialExcludeAllPluginImporterConfig([NotNull] string extractedFilePath)
@@ -449,7 +509,7 @@ PluginImporter:
         }
 
         private static void TryExtractBestFrameworkSources(
-            [NotNull] [ItemNotNull] Dictionary<string, List<ZipArchiveEntry>> frameworks,
+            [NotNull][ItemNotNull] Dictionary<string, List<ZipArchiveEntry>> frameworks,
             [NotNull] string sourceDirName,
             [NotNull] INugetPackage package,
             [NotNull] PackageConfig packageConfig)

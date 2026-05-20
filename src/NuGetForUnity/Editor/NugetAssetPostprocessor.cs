@@ -256,7 +256,8 @@ namespace NugetForUnity
 
         private static bool AssetIsFileInsideNuGetRepository([NotNull] string absoluteAssetPath, [NotNull] string absoluteRepositoryPath)
         {
-            return absoluteAssetPath.StartsWith(absoluteRepositoryPath, PathHelper.PathComparisonType) && File.Exists(absoluteAssetPath);
+            return absoluteAssetPath.StartsWith(absoluteRepositoryPath, PathHelper.PathComparisonType) &&
+                   (File.Exists(absoluteAssetPath) || Directory.Exists(absoluteAssetPath));
         }
 
         /// <summary>
@@ -429,7 +430,7 @@ namespace NugetForUnity
             delayedAssetEditor?.Start();
             plugin.SetCompatibleWithAnyPlatform(false);
 
-            var otherRuntimes = Directory.EnumerateFiles(absoluteRuntimesDirectoryPath, "*", SearchOption.AllDirectories)
+            var otherRuntimes = Directory.EnumerateFileSystemEntries(absoluteRuntimesDirectoryPath, "*", SearchOption.AllDirectories)
                 .Where(
                     filePath => filePath != absoluteAssetPath &&
                                 !filePath.EndsWith(".meta", StringComparison.Ordinal) &&
